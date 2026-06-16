@@ -1,0 +1,154 @@
+name: 自动代码审计
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, develop]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      pull-requests: write
+      contents: read
+      issues: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 准备审计信息
+        id: audit_info
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "audit_type=PR" >> $GITHUB_OUTPUT
+            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "pr_title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+            echo "branch=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+            echo "target_branch=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+          else
+            echo "audit_type=Commit" >> $GITHUB_OUTPUT
+            echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "commit_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 获取变更文件
+        id: changes
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff origin/${{ github.event.pull_request.base.ref }}...HEAD --name-only > /tmp/changed_files.txt
+          else
+            git diff HEAD~1 HEAD --name-only > /tmp/changed_files.txt
+          fi
+          
+          echo "changed_files=$(cat /tmp/changed_files.txt | head -20 | tr '\n' ',')" >> $GITHUB_OUTPUT
+          echo "changes_count=$(cat /tmp/changed_files.txt | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: 读取 ROADMAP
+        id: roadmap
+        run: |
+          if [ -f "ROADMAP.md" ]; then
+            echo "roadmap_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "roadmap_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 生成审计报告
+        id: audit_report
+        run: |
+          cat > /tmp/audit_template.md << 'EOF'
+          # 🔍 代码审计报告
+          
+          ## 审计信息
+          - **审计类型**: ${{ steps.audit_info.outputs.audit_type }}
+          - **变更文件数**: ${{ steps.changes.outputs.changes_count }}
+          - **Roadmap 存在**: ${{ steps.roadmap.outputs.roadmap_exists }}
+          
+          ## 审计清单
+          
+          ### 1️⃣ 功能范围检查
+          请审查本次变更是否：
+          - ✅ 完全对标 ROADMAP.md 中规划的功能点
+          - ✅ 没有实现 ROADMAP 之外的功能（不超出范围）
+          - ✅ 实现的功能是否完整（非半成品）
+          
+          ### 2️⃣ 代码质量审查
+          - ✅ 代码可读性和结构清晰度
+          - ✅ 是否有完整的注释和文档
+          - ✅ 是否遵循项目编码规范
+          - ✅ 性能考虑
+          - ✅ 错误处理
+          
+          ### 3️⃣ 文档和测试
+          - ✅ 是否更新了 README 或相关文档
+          - ✅ 是否添加了单元测试
+          - ✅ 是否包含使用示例
+          
+          ### 4️⃣ Merge 建议
+          综合以上检查，给出：
+          - **可以合并？** [是/否]
+          - **必须修复的问题**: [列表]
+          - **建议改进项**: [列表]
+          
+          ---
+          
+          **审计完成于**: ${{ github.event.pull_request.created_at || github.event.head_commit.timestamp }}
+          EOF
+          cat /tmp/audit_template.md
+          
+      - name: 评论 PR（PR 触发时）
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const changedFiles = '${{ steps.changes.outputs.changed_files }}'.split(',').filter(f => f);
+            const roadmapExists = '${{ steps.roadmap.outputs.roadmap_exists }}' === 'true';
+            
+            const comment = `## 🤖 自动代码审计已启动
+
+            ### 📋 PR 信息
+            - **标题**: ${{ github.event.pull_request.title }}
+            - **源分支**: ${{ steps.audit_info.outputs.branch }}
+            - **目标分支**: ${{ steps.audit_info.outputs.target_branch }}
+            - **变更文件数**: ${{ steps.changes.outputs.changes_count }}
+            
+            ### 📂 变更文件
+            \`\`\`
+            ${changedFiles.map(f => f.trim()).join('\n')}
+            \`\`\`
+            
+            ${roadmapExists ? `### ✅ 审计维度
+            1. **功能范围审查**: 检查是否超出 ROADMAP 规划
+            2. **完整性审查**: 检查功能是否完整实现
+            3. **代码质量审查**: 检查代码质量、可读性、性能
+            4. **文档测试审查**: 检查文档更新和测试覆盖
+            5. **Merge 建议**: 给出是否可以合并的建议
+            
+            ### 📖 Roadmap 已存在
+            将参照 ROADMAP.md 中的规划进行审计。` : `### ⚠️ 未找到 ROADMAP.md
+            请先创建 ROADMAP.md 来定义项目规划，以启用完整的功能范围检查。`}
+            
+            ---
+            
+            > 💡 **提示**: 这是自动触发的审计工作流。建议使用 Copilot 读取这个 PR 的详细变更内容进行深入分析。`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: 工作流完成
+        run: |
+          echo "✅ 代码审计工作流完成"
+          echo ""
+          echo "📊 审计摘要"
+          echo "- 审计类型: ${{ steps.audit_info.outputs.audit_type }}"
+          echo "- 变更文件数: ${{ steps.changes.outputs.changes_count }}"
+          echo "- Roadmap 状态: ${{ steps.roadmap.outputs.roadmap_exists }}"
